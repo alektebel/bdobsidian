@@ -10,6 +10,7 @@ import { RawNoteOrganizer, OrganizerSettings, DEFAULT_ORGANIZER_SETTINGS, Organi
 import { OrganizeApprovalModal } from './organize-approval-modal';
 import { ModelPickerModal } from './model-picker-modal';
 import { ContextMenuHarness, organizeAction, summarizeAction } from './context-menu';
+import { GitSync } from './git-sync';
 
 interface VectorDBPluginSettings {
     modelPath: string;
@@ -25,6 +26,8 @@ interface VectorDBPluginSettings {
     ollamaModel: string;
     webSearch: WebSearchSettings;
     organizer: OrganizerSettings;
+    gitAutoPull: boolean;
+    gitCommitMessage: string;
 }
 
 const DEFAULT_SETTINGS: VectorDBPluginSettings = {
@@ -41,6 +44,8 @@ const DEFAULT_SETTINGS: VectorDBPluginSettings = {
     ollamaModel: 'ornith-35b',
     webSearch: { ...DEFAULT_WEB_SEARCH_SETTINGS },
     organizer: { ...DEFAULT_ORGANIZER_SETTINGS },
+    gitAutoPull: true,
+    gitCommitMessage: 'Auto-sync notes',
 };
 
 export default class VectorDBPlugin extends Plugin {
@@ -55,6 +60,9 @@ export default class VectorDBPlugin extends Plugin {
     private organizer: RawNoteOrganizer | null = null;
     private organizerTimerId: number | null = null;
     private contextMenuHarness: ContextMenuHarness;
+    private gitSync: GitSync;
+    private gitStatusBarEl: HTMLElement;
+    private gitStatusInterval: number | null = null;
 
     async onload() {
         await this.loadSettings();
@@ -71,6 +79,34 @@ export default class VectorDBPlugin extends Plugin {
         this.contextMenuHarness.registerAction(organizeAction);
         this.contextMenuHarness.registerAction(summarizeAction);
         this.contextMenuHarness.registerFileMenu();
+
+        // Git sync
+        this.gitSync = new GitSync((this.app.vault.adapter as any).getBasePath?.() ?? this.app.vault.adapter.basePath ?? '.');
+        this.gitStatusBarEl = this.addStatusBarItem();
+        this.gitStatusBarEl.setText('Git: ...');
+        this.gitStatusBarEl.style.cssText = 'cursor: pointer;';
+        this.gitStatusBarEl.onclick = () => this.gitPush();
+
+        const gitRibbon = this.addRibbonIcon('git-branch', 'Git sync', () => {
+            this.gitPush();
+        });
+        gitRibbon.addClass('bd-git-sync');
+
+        this.addCommand({
+            id: 'git-push',
+            name: 'Push notes to git',
+            callback: () => this.gitPush(),
+        });
+
+        this.addCommand({
+            id: 'git-pull',
+            name: 'Pull notes from git',
+            callback: () => this.gitPull(),
+        });
+
+        this.registerInterval(
+            window.setInterval(() => this.updateGitStatus(), 60000)
+        );
 
         // Add ribbon icons
         this.addRibbonIcon('database', 'Vector Database', () => {
@@ -145,6 +181,10 @@ export default class VectorDBPlugin extends Plugin {
         this.app.workspace.onLayoutReady(async () => {
             await this.initialize();
             this.setupOrganizer();
+            this.updateGitStatus();
+            if (this.settings.gitAutoPull) {
+                this.gitPull();
+            }
         });
 
         // Auto-index on file save
@@ -396,6 +436,41 @@ export default class VectorDBPlugin extends Plugin {
             }
             new Notice(`Organized ${applied}/${suggestions.length} notes`);
         }
+    }
+
+    async gitPush() {
+        const status = await this.gitSync.getStatus();
+        if (!status) {
+            this.gitStatusBarEl.setText('Git: not available');
+            return;
+        }
+        const dirty = status.dirty + status.staged;
+        if (dirty === 0 && status.ahead === 0) {
+            new Notice('Nothing to push');
+            return;
+        }
+        await this.gitSync.commitAndPush(this.settings.gitCommitMessage);
+        this.updateGitStatus();
+    }
+
+    async gitPull() {
+        this.gitStatusBarEl.setText('Git: pulling...');
+        const ok = await this.gitSync.pull();
+        this.updateGitStatus();
+    }
+
+    async updateGitStatus() {
+        const status = await this.gitSync.getStatus();
+        if (!status) {
+            this.gitStatusBarEl.setText('Git: not available');
+            return;
+        }
+        const parts: string[] = [];
+        const dirty = status.dirty + status.staged;
+        if (dirty > 0) parts.push(`⚠${dirty}`);
+        if (status.ahead > 0) parts.push(`↑${status.ahead}`);
+        if (status.behind > 0) parts.push(`↓${status.behind}`);
+        this.gitStatusBarEl.setText(parts.length > 0 ? parts.join(' ') : 'Git: ok');
     }
 
     async search(query: string) {
@@ -782,6 +857,38 @@ class VectorDBSettingTab extends PluginSettingTab {
                     const ok = await client.checkConnection();
                     new Notice(ok ? 'Connected to Ornith!' : 'Could not connect. Check Ollama is running.');
                 }));
+
+        // Git sync settings
+        containerEl.createEl('h3', { text: 'Git Sync' });
+
+        new Setting(containerEl)
+            .setName('Auto-pull on startup')
+            .setDesc('Automatically pull latest from git when Obsidian opens')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.gitAutoPull)
+                .onChange(async (value) => {
+                    this.plugin.settings.gitAutoPull = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Commit message')
+            .setDesc('Message used when auto-committing changes')
+            .addText(text => text
+                .setPlaceholder('Auto-sync notes')
+                .setValue(this.plugin.settings.gitCommitMessage)
+                .onChange(async (value) => {
+                    this.plugin.settings.gitCommitMessage = value || 'Auto-sync notes';
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Push now')
+            .setDesc('Commit and push pending changes to remote')
+            .addButton(btn => btn
+                .setButtonText('Push')
+                .setCta()
+                .onClick(() => this.plugin.gitPush()));
 
         // Actions
         containerEl.createEl('h3', { text: 'Actions' });

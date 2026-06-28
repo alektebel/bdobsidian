@@ -14802,7 +14802,7 @@ __export(main_exports, {
   default: () => VectorDBPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian8 = require("obsidian");
+var import_obsidian9 = require("obsidian");
 
 // node_modules/@xenova/transformers/src/utils/core.js
 function dispatchCallback(progress_callback, data) {
@@ -31738,6 +31738,136 @@ ${summary}`);
   }
 };
 
+// git-sync.ts
+var import_obsidian8 = require("obsidian");
+var import_child_process = require("child_process");
+var GitSync = class {
+  constructor(repoPath) {
+    this.available = null;
+    this.repoPath = repoPath;
+  }
+  async isAvailable() {
+    if (this.available !== null)
+      return this.available;
+    try {
+      const result = await this.run("git --version");
+      this.available = result !== null;
+      return this.available;
+    } catch {
+      this.available = false;
+      return false;
+    }
+  }
+  async getStatus() {
+    const ok = await this.isAvailable();
+    if (!ok)
+      return null;
+    const branch = await this.run("git rev-parse --abbrev-ref HEAD");
+    if (!branch)
+      return null;
+    const [dirtyRaw, stagedRaw] = await Promise.all([
+      this.run("git status --porcelain"),
+      this.run("git diff --cached --stat")
+    ]);
+    const dirty = dirtyRaw ? dirtyRaw.split("\n").filter((l) => l.trim()).length : 0;
+    const staged = stagedRaw ? stagedRaw.split("\n").filter((l) => l.trim()).length : 0;
+    const remoteRaw = await this.run("git rev-list --left-right --count HEAD...@{upstream}");
+    let ahead = 0;
+    let behind = 0;
+    if (remoteRaw) {
+      const parts = remoteRaw.trim().split(/\s+/);
+      ahead = parseInt(parts[0]) || 0;
+      behind = parseInt(parts[1]) || 0;
+    }
+    const remotesRaw = await this.run("git remote -v");
+    return {
+      dirty,
+      staged,
+      ahead,
+      behind,
+      branch: branch.trim(),
+      hasRemotes: (remotesRaw?.trim().length ?? 0) > 0
+    };
+  }
+  async pull() {
+    const ok = await this.isAvailable();
+    if (!ok)
+      return false;
+    const status = await this.getStatus();
+    if (!status)
+      return false;
+    if (!status.hasRemotes) {
+      new import_obsidian8.Notice("No git remote configured");
+      return false;
+    }
+    if (status.dirty > 0) {
+      new import_obsidian8.Notice(`Cannot pull: ${status.dirty} uncommitted change(s). Commit or stash first.`);
+      return false;
+    }
+    try {
+      const result = await this.run("git pull --ff-only");
+      if (result !== null) {
+        new import_obsidian8.Notice("Pulled latest from remote");
+        return true;
+      }
+      return false;
+    } catch {
+      new import_obsidian8.Notice("Git pull failed");
+      return false;
+    }
+  }
+  async commitAndPush(message) {
+    const ok = await this.isAvailable();
+    if (!ok)
+      return false;
+    const status = await this.getStatus();
+    if (!status)
+      return false;
+    if (status.dirty === 0 && status.staged === 0) {
+      if (status.ahead === 0) {
+        new import_obsidian8.Notice("Nothing to push");
+        return false;
+      }
+      const pushed = await this.run(`git push`);
+      if (pushed !== null) {
+        new import_obsidian8.Notice("Pushed to remote");
+        return true;
+      }
+      new import_obsidian8.Notice("Git push failed");
+      return false;
+    }
+    const addResult = await this.run(`git add -A`);
+    if (addResult === null) {
+      new import_obsidian8.Notice("Failed to stage files");
+      return false;
+    }
+    const commitResult = await this.run(`git commit -m "${message.replace(/"/g, '\\"')}"`);
+    if (commitResult === null) {
+      new import_obsidian8.Notice("Failed to commit");
+      return false;
+    }
+    const pushResult = await this.run("git push");
+    if (pushResult !== null) {
+      new import_obsidian8.Notice("Committed and pushed to remote");
+      return true;
+    }
+    new import_obsidian8.Notice("Commit succeeded but push failed. Push manually.");
+    return false;
+  }
+  async run(command) {
+    return new Promise((resolve) => {
+      const proc = (0, import_child_process.exec)(command, { cwd: this.repoPath, timeout: 3e4 }, (error, stdout) => {
+        if (error) {
+          resolve(null);
+        } else {
+          resolve(stdout);
+        }
+      });
+      proc.on("error", () => resolve(null));
+    });
+  }
+};
+
 // main.ts
 var DEFAULT_SETTINGS = {
   modelPath: "Xenova/all-MiniLM-L6-v2",
@@ -31752,9 +31882,11 @@ var DEFAULT_SETTINGS = {
   ollamaUrl: "http://localhost:11436",
   ollamaModel: "ornith-35b",
   webSearch: { ...DEFAULT_WEB_SEARCH_SETTINGS },
-  organizer: { ...DEFAULT_ORGANIZER_SETTINGS }
+  organizer: { ...DEFAULT_ORGANIZER_SETTINGS },
+  gitAutoPull: true,
+  gitCommitMessage: "Auto-sync notes"
 };
-var VectorDBPlugin = class extends import_obsidian8.Plugin {
+var VectorDBPlugin = class extends import_obsidian9.Plugin {
   constructor() {
     super(...arguments);
     this.model = null;
@@ -31763,6 +31895,7 @@ var VectorDBPlugin = class extends import_obsidian8.Plugin {
     this.isInitialized = false;
     this.organizer = null;
     this.organizerTimerId = null;
+    this.gitStatusInterval = null;
   }
   async onload() {
     await this.loadSettings();
@@ -31773,6 +31906,28 @@ var VectorDBPlugin = class extends import_obsidian8.Plugin {
     this.contextMenuHarness.registerAction(organizeAction);
     this.contextMenuHarness.registerAction(summarizeAction);
     this.contextMenuHarness.registerFileMenu();
+    this.gitSync = new GitSync(this.app.vault.adapter.getBasePath?.() ?? this.app.vault.adapter.basePath ?? ".");
+    this.gitStatusBarEl = this.addStatusBarItem();
+    this.gitStatusBarEl.setText("Git: ...");
+    this.gitStatusBarEl.style.cssText = "cursor: pointer;";
+    this.gitStatusBarEl.onclick = () => this.gitPush();
+    const gitRibbon = this.addRibbonIcon("git-branch", "Git sync", () => {
+      this.gitPush();
+    });
+    gitRibbon.addClass("bd-git-sync");
+    this.addCommand({
+      id: "git-push",
+      name: "Push notes to git",
+      callback: () => this.gitPush()
+    });
+    this.addCommand({
+      id: "git-pull",
+      name: "Pull notes from git",
+      callback: () => this.gitPull()
+    });
+    this.registerInterval(
+      window.setInterval(() => this.updateGitStatus(), 6e4)
+    );
     this.addRibbonIcon("database", "Vector Database", () => {
       this.openSearchModal();
     });
@@ -31832,10 +31987,14 @@ var VectorDBPlugin = class extends import_obsidian8.Plugin {
     this.app.workspace.onLayoutReady(async () => {
       await this.initialize();
       this.setupOrganizer();
+      this.updateGitStatus();
+      if (this.settings.gitAutoPull) {
+        this.gitPull();
+      }
     });
     this.registerEvent(
       this.app.vault.on("modify", async (file) => {
-        if (this.settings.autoIndexOnSave && file instanceof import_obsidian8.TFile && file.extension === "md") {
+        if (this.settings.autoIndexOnSave && file instanceof import_obsidian9.TFile && file.extension === "md") {
           if (this.isInitialized && this.indexer) {
             try {
               await this.indexer.updateNote(file);
@@ -31848,7 +32007,7 @@ var VectorDBPlugin = class extends import_obsidian8.Plugin {
     );
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
-        if (file instanceof import_obsidian8.TFile && file.extension === "md") {
+        if (file instanceof import_obsidian9.TFile && file.extension === "md") {
           if (this.indexer) {
             this.indexer.removeNote(file.path);
           }
@@ -31857,7 +32016,7 @@ var VectorDBPlugin = class extends import_obsidian8.Plugin {
     );
     this.registerEvent(
       this.app.vault.on("rename", async (file, oldPath) => {
-        if (file instanceof import_obsidian8.TFile && file.extension === "md") {
+        if (file instanceof import_obsidian9.TFile && file.extension === "md") {
           if (this.indexer) {
             this.indexer.removeNote(oldPath);
             await this.indexer.updateNote(file);
@@ -31872,7 +32031,7 @@ var VectorDBPlugin = class extends import_obsidian8.Plugin {
       return;
     }
     try {
-      new import_obsidian8.Notice("Initializing Vector Database...");
+      new import_obsidian9.Notice("Initializing Vector Database...");
       console.log(`Loading model: ${this.settings.modelPath}`);
       this.model = await this.modelLoader.loadModel(
         this.settings.modelPath,
@@ -31892,34 +32051,34 @@ var VectorDBPlugin = class extends import_obsidian8.Plugin {
         indexerSettings
       );
       this.isInitialized = true;
-      new import_obsidian8.Notice("Vector Database initialized successfully");
+      new import_obsidian9.Notice("Vector Database initialized successfully");
       console.log("Vector Database initialized");
     } catch (error) {
-      new import_obsidian8.Notice(`Failed to initialize Vector Database: ${error.message}`);
+      new import_obsidian9.Notice(`Failed to initialize Vector Database: ${error.message}`);
       console.error("Initialization error:", error);
     }
   }
   async indexAllNotes() {
     if (!this.isInitialized) {
-      new import_obsidian8.Notice("Vector Database not initialized. Please wait...");
+      new import_obsidian9.Notice("Vector Database not initialized. Please wait...");
       await this.initialize();
     }
     if (!this.indexer) {
-      new import_obsidian8.Notice("Indexer not available");
+      new import_obsidian9.Notice("Indexer not available");
       return;
     }
-    const notice = new import_obsidian8.Notice("Indexing all notes...", 0);
+    const notice = new import_obsidian9.Notice("Indexing all notes...", 0);
     try {
       await this.indexer.indexAllNotes((current, total, fileName) => {
         notice.setMessage(`Indexing: ${current}/${total} - ${fileName}`);
       });
       await this.saveDatabase();
       notice.hide();
-      new import_obsidian8.Notice("All notes indexed successfully");
+      new import_obsidian9.Notice("All notes indexed successfully");
       this.showStats();
     } catch (error) {
       notice.hide();
-      new import_obsidian8.Notice(`Indexing failed: ${error.message}`);
+      new import_obsidian9.Notice(`Indexing failed: ${error.message}`);
       console.error("Indexing error:", error);
     }
   }
@@ -31928,26 +32087,26 @@ var VectorDBPlugin = class extends import_obsidian8.Plugin {
       await this.initialize();
     }
     if (!this.indexer) {
-      new import_obsidian8.Notice("Indexer not available");
+      new import_obsidian9.Notice("Indexer not available");
       return;
     }
     const activeFile = this.app.workspace.getActiveFile();
     if (!activeFile) {
-      new import_obsidian8.Notice("No active file");
+      new import_obsidian9.Notice("No active file");
       return;
     }
     try {
       await this.indexer.indexNote(activeFile, true);
       await this.saveDatabase();
-      new import_obsidian8.Notice(`Indexed: ${activeFile.basename}`);
+      new import_obsidian9.Notice(`Indexed: ${activeFile.basename}`);
     } catch (error) {
-      new import_obsidian8.Notice(`Failed to index: ${error.message}`);
+      new import_obsidian9.Notice(`Failed to index: ${error.message}`);
       console.error("Index error:", error);
     }
   }
   openSearchModal() {
     if (!this.isInitialized) {
-      new import_obsidian8.Notice("Please initialize the database first by indexing your notes");
+      new import_obsidian9.Notice("Please initialize the database first by indexing your notes");
       return;
     }
     const modal = new SearchModal(
@@ -31957,7 +32116,7 @@ var VectorDBPlugin = class extends import_obsidian8.Plugin {
       },
       (result) => {
         const file = this.app.vault.getAbstractFileByPath(result.entry.metadata.path);
-        if (file instanceof import_obsidian8.TFile) {
+        if (file instanceof import_obsidian9.TFile) {
           this.app.workspace.getLeaf().openFile(file);
         }
       }
@@ -31966,7 +32125,7 @@ var VectorDBPlugin = class extends import_obsidian8.Plugin {
   }
   openChatModal() {
     if (!this.isInitialized || !this.database || !this.model) {
-      new import_obsidian8.Notice("Please initialize the database first by indexing your notes");
+      new import_obsidian9.Notice("Please initialize the database first by indexing your notes");
       return;
     }
     this.ollamaClient.setBaseUrl(this.settings.ollamaUrl);
@@ -32002,7 +32161,7 @@ var VectorDBPlugin = class extends import_obsidian8.Plugin {
   }
   async organizeRawNotes() {
     if (!this.organizer) {
-      new import_obsidian8.Notice("Organizer not initialized");
+      new import_obsidian9.Notice("Organizer not initialized");
       return;
     }
     this.organizer.updateSettings(this.settings.organizer);
@@ -32010,7 +32169,7 @@ var VectorDBPlugin = class extends import_obsidian8.Plugin {
     if (rawNotes.length === 0) {
       return;
     }
-    const notice = new import_obsidian8.Notice(`Analyzing ${rawNotes.length} raw note(s)...`, 0);
+    const notice = new import_obsidian9.Notice(`Analyzing ${rawNotes.length} raw note(s)...`, 0);
     const suggestions = [];
     for (const file of rawNotes) {
       notice.setMessage(`Analyzing: ${file.basename}...`);
@@ -32021,7 +32180,7 @@ var VectorDBPlugin = class extends import_obsidian8.Plugin {
     }
     notice.hide();
     if (suggestions.length === 0) {
-      new import_obsidian8.Notice("Could not analyze any raw notes");
+      new import_obsidian9.Notice("Could not analyze any raw notes");
       return;
     }
     if (this.settings.organizer.requireApproval) {
@@ -32038,8 +32197,43 @@ var VectorDBPlugin = class extends import_obsidian8.Plugin {
         if (ok)
           applied++;
       }
-      new import_obsidian8.Notice(`Organized ${applied}/${suggestions.length} notes`);
+      new import_obsidian9.Notice(`Organized ${applied}/${suggestions.length} notes`);
     }
+  }
+  async gitPush() {
+    const status = await this.gitSync.getStatus();
+    if (!status) {
+      this.gitStatusBarEl.setText("Git: not available");
+      return;
+    }
+    const dirty = status.dirty + status.staged;
+    if (dirty === 0 && status.ahead === 0) {
+      new import_obsidian9.Notice("Nothing to push");
+      return;
+    }
+    await this.gitSync.commitAndPush(this.settings.gitCommitMessage);
+    this.updateGitStatus();
+  }
+  async gitPull() {
+    this.gitStatusBarEl.setText("Git: pulling...");
+    const ok = await this.gitSync.pull();
+    this.updateGitStatus();
+  }
+  async updateGitStatus() {
+    const status = await this.gitSync.getStatus();
+    if (!status) {
+      this.gitStatusBarEl.setText("Git: not available");
+      return;
+    }
+    const parts = [];
+    const dirty = status.dirty + status.staged;
+    if (dirty > 0)
+      parts.push(`\u26A0${dirty}`);
+    if (status.ahead > 0)
+      parts.push(`\u2191${status.ahead}`);
+    if (status.behind > 0)
+      parts.push(`\u2193${status.behind}`);
+    this.gitStatusBarEl.setText(parts.length > 0 ? parts.join(" ") : "Git: ok");
   }
   async search(query) {
     if (!this.model || !this.database) {
@@ -32057,16 +32251,16 @@ var VectorDBPlugin = class extends import_obsidian8.Plugin {
     if (this.database) {
       this.database.clear();
       await this.saveDatabase();
-      new import_obsidian8.Notice("Vector index cleared");
+      new import_obsidian9.Notice("Vector index cleared");
     }
   }
   showStats() {
     if (!this.indexer) {
-      new import_obsidian8.Notice("Indexer not initialized");
+      new import_obsidian9.Notice("Indexer not initialized");
       return;
     }
     const stats = this.indexer.getStats();
-    new import_obsidian8.Notice(
+    new import_obsidian9.Notice(
       `Database Stats:
 Documents: ${stats.totalDocuments}
 Vectors: ${stats.totalVectors}
@@ -32110,7 +32304,7 @@ Avg vectors/doc: ${stats.avgVectorsPerDocument.toFixed(1)}`,
     await this.saveData(this.settings);
   }
 };
-var VectorDBSettingTab = class extends import_obsidian8.PluginSettingTab {
+var VectorDBSettingTab = class extends import_obsidian9.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -32120,15 +32314,15 @@ var VectorDBSettingTab = class extends import_obsidian8.PluginSettingTab {
     containerEl.empty();
     containerEl.createEl("h2", { text: "Vector Database Settings" });
     containerEl.createEl("h3", { text: "Embedding Model" });
-    new import_obsidian8.Setting(containerEl).setName("Model path").setDesc("HuggingFace model path or local directory (e.g., Xenova/all-MiniLM-L6-v2)").addText((text) => text.setPlaceholder("Xenova/all-MiniLM-L6-v2").setValue(this.plugin.settings.modelPath).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Model path").setDesc("HuggingFace model path or local directory (e.g., Xenova/all-MiniLM-L6-v2)").addText((text) => text.setPlaceholder("Xenova/all-MiniLM-L6-v2").setValue(this.plugin.settings.modelPath).onChange(async (value) => {
       this.plugin.settings.modelPath = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian8.Setting(containerEl).setName("Model name").setDesc("Display name for the model").addText((text) => text.setPlaceholder("all-MiniLM-L6-v2").setValue(this.plugin.settings.modelName).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Model name").setDesc("Display name for the model").addText((text) => text.setPlaceholder("all-MiniLM-L6-v2").setValue(this.plugin.settings.modelName).onChange(async (value) => {
       this.plugin.settings.modelName = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian8.Setting(containerEl).setName("Embedding dimension").setDesc("Vector dimension of the model (default: 384 for MiniLM)").addText((text) => text.setPlaceholder("384").setValue(String(this.plugin.settings.embeddingDimension)).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Embedding dimension").setDesc("Vector dimension of the model (default: 384 for MiniLM)").addText((text) => text.setPlaceholder("384").setValue(String(this.plugin.settings.embeddingDimension)).onChange(async (value) => {
       const dim = parseInt(value);
       if (!isNaN(dim) && dim > 0) {
         this.plugin.settings.embeddingDimension = dim;
@@ -32136,37 +32330,37 @@ var VectorDBSettingTab = class extends import_obsidian8.PluginSettingTab {
       }
     }));
     containerEl.createEl("h3", { text: "Indexing" });
-    new import_obsidian8.Setting(containerEl).setName("Chunk size").setDesc("Number of characters per chunk").addText((text) => text.setPlaceholder("500").setValue(String(this.plugin.settings.chunkSize)).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Chunk size").setDesc("Number of characters per chunk").addText((text) => text.setPlaceholder("500").setValue(String(this.plugin.settings.chunkSize)).onChange(async (value) => {
       const size = parseInt(value);
       if (!isNaN(size) && size > 0) {
         this.plugin.settings.chunkSize = size;
         await this.plugin.saveSettings();
       }
     }));
-    new import_obsidian8.Setting(containerEl).setName("Chunk overlap").setDesc("Number of overlapping characters between chunks").addText((text) => text.setPlaceholder("50").setValue(String(this.plugin.settings.chunkOverlap)).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Chunk overlap").setDesc("Number of overlapping characters between chunks").addText((text) => text.setPlaceholder("50").setValue(String(this.plugin.settings.chunkOverlap)).onChange(async (value) => {
       const overlap = parseInt(value);
       if (!isNaN(overlap) && overlap >= 0) {
         this.plugin.settings.chunkOverlap = overlap;
         await this.plugin.saveSettings();
       }
     }));
-    new import_obsidian8.Setting(containerEl).setName("Exclude patterns").setDesc("Regex patterns to exclude files (separated by |)").addText((text) => text.setPlaceholder("^\\..*|node_modules").setValue(this.plugin.settings.excludePatterns).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Exclude patterns").setDesc("Regex patterns to exclude files (separated by |)").addText((text) => text.setPlaceholder("^\\..*|node_modules").setValue(this.plugin.settings.excludePatterns).onChange(async (value) => {
       this.plugin.settings.excludePatterns = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian8.Setting(containerEl).setName("Auto-index on save").setDesc("Automatically update index when files are modified").addToggle((toggle) => toggle.setValue(this.plugin.settings.autoIndexOnSave).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Auto-index on save").setDesc("Automatically update index when files are modified").addToggle((toggle) => toggle.setValue(this.plugin.settings.autoIndexOnSave).onChange(async (value) => {
       this.plugin.settings.autoIndexOnSave = value;
       await this.plugin.saveSettings();
     }));
     containerEl.createEl("h3", { text: "Search" });
-    new import_obsidian8.Setting(containerEl).setName("Top K results").setDesc("Maximum number of search results to return").addText((text) => text.setPlaceholder("10").setValue(String(this.plugin.settings.searchTopK)).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Top K results").setDesc("Maximum number of search results to return").addText((text) => text.setPlaceholder("10").setValue(String(this.plugin.settings.searchTopK)).onChange(async (value) => {
       const topK = parseInt(value);
       if (!isNaN(topK) && topK > 0) {
         this.plugin.settings.searchTopK = topK;
         await this.plugin.saveSettings();
       }
     }));
-    new import_obsidian8.Setting(containerEl).setName("Similarity threshold").setDesc("Minimum similarity score (0-1) to include in results").addText((text) => text.setPlaceholder("0.3").setValue(String(this.plugin.settings.searchThreshold)).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Similarity threshold").setDesc("Minimum similarity score (0-1) to include in results").addText((text) => text.setPlaceholder("0.3").setValue(String(this.plugin.settings.searchThreshold)).onChange(async (value) => {
       const threshold = parseFloat(value);
       if (!isNaN(threshold) && threshold >= 0 && threshold <= 1) {
         this.plugin.settings.searchThreshold = threshold;
@@ -32174,33 +32368,33 @@ var VectorDBSettingTab = class extends import_obsidian8.PluginSettingTab {
       }
     }));
     containerEl.createEl("h3", { text: "Web Search Tool" });
-    new import_obsidian8.Setting(containerEl).setName("Enable web search").setDesc("Allow the Ornith model to search the web for current information").addToggle((toggle) => toggle.setValue(this.plugin.settings.webSearch.enabled).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Enable web search").setDesc("Allow the Ornith model to search the web for current information").addToggle((toggle) => toggle.setValue(this.plugin.settings.webSearch.enabled).onChange(async (value) => {
       this.plugin.settings.webSearch.enabled = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian8.Setting(containerEl).setName("Search provider").setDesc("DuckDuckGo (no API key needed) or Google Custom Search").addDropdown((dropdown) => dropdown.addOption("duckduckgo", "DuckDuckGo").addOption("google", "Google Custom Search").setValue(this.plugin.settings.webSearch.provider).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Search provider").setDesc("DuckDuckGo (no API key needed) or Google Custom Search").addDropdown((dropdown) => dropdown.addOption("duckduckgo", "DuckDuckGo").addOption("google", "Google Custom Search").setValue(this.plugin.settings.webSearch.provider).onChange(async (value) => {
       this.plugin.settings.webSearch.provider = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian8.Setting(containerEl).setName("Google API key").setDesc("Required for Google Custom Search (https://developers.google.com/custom-search)").addText((text) => text.setPlaceholder("AIza...").setValue(this.plugin.settings.webSearch.googleApiKey).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Google API key").setDesc("Required for Google Custom Search (https://developers.google.com/custom-search)").addText((text) => text.setPlaceholder("AIza...").setValue(this.plugin.settings.webSearch.googleApiKey).onChange(async (value) => {
       this.plugin.settings.webSearch.googleApiKey = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian8.Setting(containerEl).setName("Google Search Engine ID").setDesc("cx parameter from Google Custom Search").addText((text) => text.setPlaceholder("0123456789...").setValue(this.plugin.settings.webSearch.googleCx).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Google Search Engine ID").setDesc("cx parameter from Google Custom Search").addText((text) => text.setPlaceholder("0123456789...").setValue(this.plugin.settings.webSearch.googleCx).onChange(async (value) => {
       this.plugin.settings.webSearch.googleCx = value;
       await this.plugin.saveSettings();
     }));
     containerEl.createEl("h3", { text: "Raw Note Organizer" });
-    new import_obsidian8.Setting(containerEl).setName("Enable auto-organizer").setDesc("Periodically organize new notes from the raw folder").addToggle((toggle) => toggle.setValue(this.plugin.settings.organizer.enabled).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Enable auto-organizer").setDesc("Periodically organize new notes from the raw folder").addToggle((toggle) => toggle.setValue(this.plugin.settings.organizer.enabled).onChange(async (value) => {
       this.plugin.settings.organizer.enabled = value;
       await this.plugin.saveSettings();
       this.plugin.setupOrganizer();
     }));
-    new import_obsidian8.Setting(containerEl).setName("Raw folder").setDesc("Folder to watch for new notes to organize").addText((text) => text.setPlaceholder("raw").setValue(this.plugin.settings.organizer.rawFolder).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Raw folder").setDesc("Folder to watch for new notes to organize").addText((text) => text.setPlaceholder("raw").setValue(this.plugin.settings.organizer.rawFolder).onChange(async (value) => {
       this.plugin.settings.organizer.rawFolder = value || "raw";
       await this.plugin.saveSettings();
     }));
-    new import_obsidian8.Setting(containerEl).setName("Interval (minutes)").setDesc("How often to check for new raw notes (default: 120 = 2 hours)").addText((text) => text.setPlaceholder("120").setValue(String(this.plugin.settings.organizer.intervalMinutes)).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Interval (minutes)").setDesc("How often to check for new raw notes (default: 120 = 2 hours)").addText((text) => text.setPlaceholder("120").setValue(String(this.plugin.settings.organizer.intervalMinutes)).onChange(async (value) => {
       const mins = parseInt(value);
       if (!isNaN(mins) && mins >= 5) {
         this.plugin.settings.organizer.intervalMinutes = mins;
@@ -32208,20 +32402,20 @@ var VectorDBSettingTab = class extends import_obsidian8.PluginSettingTab {
         this.plugin.setupOrganizer();
       }
     }));
-    new import_obsidian8.Setting(containerEl).setName("Require approval").setDesc("Show approval dialog before applying changes").addToggle((toggle) => toggle.setValue(this.plugin.settings.organizer.requireApproval).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Require approval").setDesc("Show approval dialog before applying changes").addToggle((toggle) => toggle.setValue(this.plugin.settings.organizer.requireApproval).onChange(async (value) => {
       this.plugin.settings.organizer.requireApproval = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian8.Setting(containerEl).setName("Organize now").setDesc("Run organization on raw folder immediately").addButton((btn) => btn.setButtonText("Organize").setCta().onClick(() => {
+    new import_obsidian9.Setting(containerEl).setName("Organize now").setDesc("Run organization on raw folder immediately").addButton((btn) => btn.setButtonText("Organize").setCta().onClick(() => {
       this.plugin.organizeRawNotes();
     }));
     containerEl.createEl("h3", { text: "Ornith (Local LLM)" });
-    new import_obsidian8.Setting(containerEl).setName("Ollama URL").setDesc("URL of your Ollama instance (default: http://localhost:11434)").addText((text) => text.setPlaceholder("http://localhost:11434").setValue(this.plugin.settings.ollamaUrl).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Ollama URL").setDesc("URL of your Ollama instance (default: http://localhost:11434)").addText((text) => text.setPlaceholder("http://localhost:11434").setValue(this.plugin.settings.ollamaUrl).onChange(async (value) => {
       this.plugin.settings.ollamaUrl = value;
       this.plugin.contextMenuHarness.setOllamaUrl(value);
       await this.plugin.saveSettings();
     }));
-    new import_obsidian8.Setting(containerEl).setName("Ornith model name").setDesc("Model name for the Ornith server (e.g., ornith-35b)").addText((text) => text.setPlaceholder("hf.co/bartowski/...").setValue(this.plugin.settings.ollamaModel).onChange(async (value) => {
+    new import_obsidian9.Setting(containerEl).setName("Ornith model name").setDesc("Model name for the Ornith server (e.g., ornith-35b)").addText((text) => text.setPlaceholder("hf.co/bartowski/...").setValue(this.plugin.settings.ollamaModel).onChange(async (value) => {
       this.plugin.settings.ollamaModel = value;
       await this.plugin.saveSettings();
     })).addButton((btn) => btn.setButtonText("Browse").onClick(() => {
@@ -32238,16 +32432,26 @@ var VectorDBSettingTab = class extends import_obsidian8.PluginSettingTab {
       );
       modal.open();
     }));
-    new import_obsidian8.Setting(containerEl).setName("Test connection").setDesc("Check if Ollama is running and the model is available").addButton((btn) => btn.setButtonText("Test").onClick(async () => {
+    new import_obsidian9.Setting(containerEl).setName("Test connection").setDesc("Check if Ollama is running and the model is available").addButton((btn) => btn.setButtonText("Test").onClick(async () => {
       const client = new OllamaClient(
         this.plugin.settings.ollamaUrl,
         this.plugin.settings.ollamaModel
       );
       const ok = await client.checkConnection();
-      new import_obsidian8.Notice(ok ? "Connected to Ornith!" : "Could not connect. Check Ollama is running.");
+      new import_obsidian9.Notice(ok ? "Connected to Ornith!" : "Could not connect. Check Ollama is running.");
     }));
+    containerEl.createEl("h3", { text: "Git Sync" });
+    new import_obsidian9.Setting(containerEl).setName("Auto-pull on startup").setDesc("Automatically pull latest from git when Obsidian opens").addToggle((toggle) => toggle.setValue(this.plugin.settings.gitAutoPull).onChange(async (value) => {
+      this.plugin.settings.gitAutoPull = value;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian9.Setting(containerEl).setName("Commit message").setDesc("Message used when auto-committing changes").addText((text) => text.setPlaceholder("Auto-sync notes").setValue(this.plugin.settings.gitCommitMessage).onChange(async (value) => {
+      this.plugin.settings.gitCommitMessage = value || "Auto-sync notes";
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian9.Setting(containerEl).setName("Push now").setDesc("Commit and push pending changes to remote").addButton((btn) => btn.setButtonText("Push").setCta().onClick(() => this.plugin.gitPush()));
     containerEl.createEl("h3", { text: "Actions" });
-    new import_obsidian8.Setting(containerEl).setName("Reinitialize").setDesc("Reload the model and reinitialize the database").addButton((btn) => btn.setButtonText("Reinitialize").onClick(async () => {
+    new import_obsidian9.Setting(containerEl).setName("Reinitialize").setDesc("Reload the model and reinitialize the database").addButton((btn) => btn.setButtonText("Reinitialize").onClick(async () => {
       this.plugin.isInitialized = false;
       await this.plugin.initialize();
     }));
