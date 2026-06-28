@@ -152,6 +152,30 @@ export class OllamaClient {
         return full;
     }
 
+    async importModel(name: string, ggufPath: string, systemPrompt?: string): Promise<boolean> {
+        try {
+            let modelfile = `FROM ${ggufPath}`;
+            if (systemPrompt) {
+                modelfile += `\nSYSTEM """${systemPrompt}"""`;
+            }
+
+            const resp = await fetch(`${this.baseUrl}/api/create`, {
+                method: 'POST',
+                body: JSON.stringify({ model: name, modelfile }),
+            });
+
+            if (!resp.ok) {
+                const err = await resp.text();
+                console.error('Ollama import failed:', err);
+                return false;
+            }
+            return true;
+        } catch (e) {
+            console.error('Ollama import error:', e);
+            return false;
+        }
+    }
+
     async listModels(): Promise<string[]> {
         try {
             const resp = await fetch(`${this.baseUrl}/api/tags`);

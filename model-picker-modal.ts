@@ -1,5 +1,6 @@
 import { App, Modal, Notice } from 'obsidian';
 import { OllamaClient } from './ollama-client';
+import { ImportModelModal } from './import-model-modal';
 
 export class ModelPickerModal extends Modal {
     private client: OllamaClient;
@@ -25,6 +26,15 @@ export class ModelPickerModal extends Modal {
         contentEl.empty();
 
         contentEl.createEl('h2', { text: 'Available Models' });
+
+        const importBtn = contentEl.createEl('button', { text: '+ Import GGUF' });
+        importBtn.style.cssText = 'margin-bottom: 12px; padding: 6px 14px; cursor: pointer;';
+        importBtn.onclick = () => {
+            const modal = new ImportModelModal(this.app, this.client, () => {
+                this.onOpen();
+            });
+            modal.open();
+        };
 
         const statusEl = contentEl.createEl('p', { text: 'Loading models...' });
 
