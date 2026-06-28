@@ -30955,7 +30955,7 @@ var DEFAULT_WEB_SEARCH_SETTINGS = {
   googleApiKey: "",
   googleCx: ""
 };
-function getToolDefinition() {
+function getSearchToolDefinition() {
   return {
     type: "function",
     function: {
@@ -30977,6 +30977,28 @@ function getToolDefinition() {
       }
     }
   };
+}
+function getFetchUrlToolDefinition() {
+  return {
+    type: "function",
+    function: {
+      name: "fetch_url",
+      description: "Fetch and read the content of a URL. Use this to get the full text of a web page, article, or API response. Returns the page text content.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: {
+            type: "string",
+            description: "The full URL to fetch (including https://)"
+          }
+        },
+        required: ["url"]
+      }
+    }
+  };
+}
+function getAllToolDefinitions() {
+  return [getSearchToolDefinition(), getFetchUrlToolDefinition()];
 }
 async function executeWebSearch(query, settings, maxResults = 5) {
   let results;
@@ -31049,6 +31071,18 @@ async function googleSearch(query, apiKey, cx, maxResults) {
     snippet: item.snippet || ""
   }));
 }
+async function executeFetchUrl(url2) {
+  try {
+    const resp = await fetch(url2, { signal: AbortSignal.timeout(15e3) });
+    const text = await resp.text();
+    const content = text.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "").replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+    const maxLen = 8e3;
+    const trimmed = content.length > maxLen ? content.slice(0, maxLen) + "..." : content;
+    return trimmed || "(empty page)";
+  } catch (e) {
+    return `Error fetching URL: ${e.message}`;
+  }
+}
 
 // chat-modal.ts
 var ChatModal = class extends import_obsidian2.Modal {
@@ -31115,9 +31149,9 @@ ${context || "(No relevant notes found)"}`
         const contentDiv = bubble.querySelector(".chat-bubble-content");
         let fullResponse;
         if (this.webSearchSettings.enabled) {
-          const tools = [getToolDefinition()];
+          const tools = getAllToolDefinitions();
           const searchStatus = contentEl.createEl("div", {
-            text: "Searching the web..."
+            text: "---"
           });
           searchStatus.style.cssText = "font-size: 0.8em; color: var(--text-muted); margin-bottom: 4px;";
           fullResponse = await this.ollama.chatWithTools(
@@ -31131,7 +31165,13 @@ ${context || "(No relevant notes found)"}`
                   this.webSearchSettings,
                   args.maxResults || 5
                 );
-                searchStatus.textContent = `Web search results for "${args.query}" ready.`;
+                searchStatus.textContent = "";
+                return result;
+              }
+              if (name2 === "fetch_url") {
+                searchStatus.textContent = `Fetching: ${args.url}...`;
+                const result = await executeFetchUrl(args.url || "");
+                searchStatus.textContent = "";
                 return result;
               }
               return `Unknown tool: ${name2}`;
@@ -31139,7 +31179,6 @@ ${context || "(No relevant notes found)"}`
             (chunk) => {
               contentDiv.textContent += chunk;
               messagesContainer.scrollTop = messagesContainer.scrollHeight;
-              searchStatus.textContent = "";
             }
           );
           searchStatus.remove();

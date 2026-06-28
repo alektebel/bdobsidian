@@ -20,7 +20,7 @@ export interface WebSearchResult {
     snippet: string;
 }
 
-export function getToolDefinition() {
+export function getSearchToolDefinition() {
     return {
         type: 'function' as const,
         function: {
@@ -42,6 +42,30 @@ export function getToolDefinition() {
             },
         },
     };
+}
+
+export function getFetchUrlToolDefinition() {
+    return {
+        type: 'function' as const,
+        function: {
+            name: 'fetch_url',
+            description: 'Fetch and read the content of a URL. Use this to get the full text of a web page, article, or API response. Returns the page text content.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    url: {
+                        type: 'string',
+                        description: 'The full URL to fetch (including https://)',
+                    },
+                },
+                required: ['url'],
+            },
+        },
+    };
+}
+
+export function getAllToolDefinitions() {
+    return [getSearchToolDefinition(), getFetchUrlToolDefinition()];
 }
 
 export async function executeWebSearch(
@@ -127,4 +151,24 @@ async function googleSearch(query: string, apiKey: string, cx: string, maxResult
         url: item.link || '',
         snippet: item.snippet || '',
     }));
+}
+
+export async function executeFetchUrl(url: string): Promise<string> {
+    try {
+        const resp = await fetch(url, { signal: AbortSignal.timeout(15000) });
+        const text = await resp.text();
+
+        const content = text
+            .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+            .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+            .replace(/<[^>]+>/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        const maxLen = 8000;
+        const trimmed = content.length > maxLen ? content.slice(0, maxLen) + '...' : content;
+        return trimmed || '(empty page)';
+    } catch (e: any) {
+        return `Error fetching URL: ${e.message}`;
+    }
 }

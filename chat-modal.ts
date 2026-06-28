@@ -1,7 +1,7 @@
 import { App, Modal, Setting } from 'obsidian';
 import { OllamaClient, ToolDefinition, OllamaMessage } from './ollama-client';
 import { VectorDatabase, SearchResult } from './vector-database';
-import { WebSearchSettings, getToolDefinition, executeWebSearch } from './web-search-tool';
+import { WebSearchSettings, getAllToolDefinitions, executeWebSearch, executeFetchUrl } from './web-search-tool';
 
 export class ChatModal extends Modal {
     private query: string = '';
@@ -90,10 +90,10 @@ export class ChatModal extends Modal {
                 let fullResponse: string;
 
                 if (this.webSearchSettings.enabled) {
-                    const tools: ToolDefinition[] = [getToolDefinition()];
+                    const tools: ToolDefinition[] = getAllToolDefinitions();
 
                     const searchStatus = contentEl.createEl('div', {
-                        text: 'Searching the web...',
+                        text: '---',
                     });
                     searchStatus.style.cssText = 'font-size: 0.8em; color: var(--text-muted); margin-bottom: 4px;';
 
@@ -108,7 +108,13 @@ export class ChatModal extends Modal {
                                     this.webSearchSettings,
                                     args.maxResults || 5,
                                 );
-                                searchStatus.textContent = `Web search results for "${args.query}" ready.`;
+                                searchStatus.textContent = '';
+                                return result;
+                            }
+                            if (name === 'fetch_url') {
+                                searchStatus.textContent = `Fetching: ${args.url}...`;
+                                const result = await executeFetchUrl(args.url || '');
+                                searchStatus.textContent = '';
                                 return result;
                             }
                             return `Unknown tool: ${name}`;
@@ -116,7 +122,6 @@ export class ChatModal extends Modal {
                         (chunk) => {
                             contentDiv.textContent += chunk;
                             messagesContainer.scrollTop = messagesContainer.scrollHeight;
-                            searchStatus.textContent = '';
                         },
                     );
 
