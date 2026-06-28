@@ -1,6 +1,7 @@
 import { App, Modal, Setting } from 'obsidian';
-import { OllamaClient } from './ollama-client';
+import { OllamaClient, ToolDefinition, OllamaMessage } from './ollama-client';
 import { VectorDatabase, SearchResult } from './vector-database';
+import { WebSearchSettings, getToolDefinition, executeWebSearch } from './web-search-tool';
 
 export class ChatModal extends Modal {
     private query: string = '';
@@ -8,17 +9,20 @@ export class ChatModal extends Modal {
     private ollama: OllamaClient;
     private embedQuery: (text: string) => Promise<number[][]>;
     private messages: Array<{ role: string; content: string }> = [];
+    private webSearchSettings: WebSearchSettings;
 
     constructor(
         app: App,
         database: VectorDatabase,
         ollama: OllamaClient,
         embedQuery: (text: string) => Promise<number[][]>,
+        webSearchSettings?: WebSearchSettings,
     ) {
         super(app);
         this.database = database;
         this.ollama = ollama;
         this.embedQuery = embedQuery;
+        this.webSearchSettings = webSearchSettings ?? { enabled: false, provider: 'duckduckgo', googleApiKey: '', googleCx: '' };
     }
 
     onOpen() {
@@ -68,26 +72,61 @@ export class ChatModal extends Modal {
                     })
                     .join('\n\n---\n\n');
 
-                const oaiMessages = [
+                const oaiMessages: OllamaMessage[] = [
                     {
-                        role: 'system' as const,
+                        role: 'system',
                         content: `You are an AI assistant with access to the user's Obsidian vault notes. Use the provided notes as context to answer questions. If the notes don't contain the answer, say so. Be concise.\n\nRelevant notes from vault:\n\n${context || '(No relevant notes found)'}`,
                     },
                     ...this.messages.map(m => ({
-                        role: (m.role === 'assistant' ? 'assistant' : 'user') as 'assistant' | 'user',
+                        role: (m.role === 'assistant' ? 'assistant' : 'user') as 'user' | 'assistant',
                         content: m.content,
                     })),
-                    { role: 'user' as const, content: q },
+                    { role: 'user', content: q },
                 ];
 
-                // Stream the response
                 const bubble = this.createBubble(messagesContainer, '', 'assistant');
                 const contentDiv = bubble.querySelector('.chat-bubble-content')!;
 
-                const fullResponse = await this.ollama.chat(oaiMessages, (chunk) => {
-                    contentDiv.textContent += chunk;
-                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
-                });
+                let fullResponse: string;
+
+                if (this.webSearchSettings.enabled) {
+                    const tools: ToolDefinition[] = [getToolDefinition()];
+
+                    const searchStatus = contentEl.createEl('div', {
+                        text: 'Searching the web...',
+                    });
+                    searchStatus.style.cssText = 'font-size: 0.8em; color: var(--text-muted); margin-bottom: 4px;';
+
+                    fullResponse = await this.ollama.chatWithTools(
+                        oaiMessages,
+                        tools,
+                        async (name, args) => {
+                            if (name === 'web_search') {
+                                searchStatus.textContent = `Searching web for: "${args.query}"...`;
+                                const result = await executeWebSearch(
+                                    args.query || '',
+                                    this.webSearchSettings,
+                                    args.maxResults || 5,
+                                );
+                                searchStatus.textContent = `Web search results for "${args.query}" ready.`;
+                                return result;
+                            }
+                            return `Unknown tool: ${name}`;
+                        },
+                        (chunk) => {
+                            contentDiv.textContent += chunk;
+                            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                            searchStatus.textContent = '';
+                        },
+                    );
+
+                    searchStatus.remove();
+                } else {
+                    fullResponse = await this.ollama.chat(oaiMessages, (chunk) => {
+                        contentDiv.textContent += chunk;
+                        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                    });
+                }
 
                 this.messages.push({ role: 'user', content: q });
                 this.messages.push({ role: 'assistant', content: fullResponse });

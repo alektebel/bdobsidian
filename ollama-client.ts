@@ -1,11 +1,23 @@
 export interface OllamaMessage {
-    role: 'system' | 'user' | 'assistant';
+    role: 'system' | 'user' | 'assistant' | 'tool';
     content: string;
+    tool_calls?: OllamaToolCall[];
 }
 
-export interface ChatResponse {
-    message: OllamaMessage;
-    done: boolean;
+export interface OllamaToolCall {
+    function: {
+        name: string;
+        arguments: string;
+    };
+}
+
+export interface ToolDefinition {
+    type: 'function';
+    function: {
+        name: string;
+        description: string;
+        parameters: object;
+    };
 }
 
 export class OllamaClient {
@@ -25,8 +37,12 @@ export class OllamaClient {
         this.baseUrl = url;
     }
 
-    async chat(messages: OllamaMessage[], onChunk?: (text: string) => void): Promise<string> {
-        const body = JSON.stringify({
+    async chat(
+        messages: OllamaMessage[],
+        onChunk?: (text: string) => void,
+        tools?: ToolDefinition[],
+    ): Promise<string> {
+        const bodyObj: any = {
             model: this.model,
             messages: messages,
             stream: onChunk != null,
@@ -34,7 +50,13 @@ export class OllamaClient {
                 temperature: 0.6,
                 num_predict: 4096,
             },
-        });
+        };
+
+        if (tools && tools.length > 0) {
+            bodyObj.tools = tools;
+        }
+
+        const body = JSON.stringify(bodyObj);
 
         if (onChunk) {
             return this.streamChat(body, onChunk);
@@ -46,6 +68,57 @@ export class OllamaClient {
         });
         const data = await resp.json();
         return data.message?.content ?? '';
+    }
+
+    async chatWithTools(
+        messages: OllamaMessage[],
+        tools: ToolDefinition[],
+        executeTool: (name: string, args: any) => Promise<string>,
+        onChunk?: (text: string) => void,
+    ): Promise<string> {
+        const bodyObj: any = {
+            model: this.model,
+            messages: messages,
+            stream: false,
+            options: {
+                temperature: 0.6,
+                num_predict: 4096,
+            },
+            tools: tools,
+        };
+
+        const body = JSON.stringify(bodyObj);
+
+        const resp = await fetch(`${this.baseUrl}/api/chat`, {
+            method: 'POST',
+            body,
+        });
+        const data = await resp.json();
+
+        const toolCalls: OllamaToolCall[] | undefined = data.message?.tool_calls;
+
+        if (toolCalls && toolCalls.length > 0) {
+            messages.push({ role: 'assistant', content: data.message?.content ?? '', tool_calls: toolCalls });
+
+            for (const tc of toolCalls) {
+                let args: any;
+                try {
+                    args = JSON.parse(tc.function.arguments);
+                } catch {
+                    args = { query: tc.function.arguments };
+                }
+                const result = await executeTool(tc.function.name, args);
+                messages.push({ role: 'tool', content: result });
+            }
+
+            return this.chatWithTools(messages, tools, executeTool, onChunk);
+        }
+
+        const content = data.message?.content ?? '';
+        if (onChunk) {
+            onChunk(content);
+        }
+        return content;
     }
 
     private async streamChat(body: string, onChunk: (text: string) => void): Promise<string> {
@@ -77,6 +150,17 @@ export class OllamaClient {
         }
 
         return full;
+    }
+
+    async listModels(): Promise<string[]> {
+        try {
+            const resp = await fetch(`${this.baseUrl}/api/tags`);
+            const data = await resp.json();
+            if (!Array.isArray(data.models)) return [];
+            return data.models.map((m: any) => m.name);
+        } catch {
+            return [];
+        }
     }
 
     async checkConnection(): Promise<boolean> {

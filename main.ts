@@ -5,6 +5,11 @@ import { NoteIndexer, IndexerSettings } from './note-indexer';
 import { SearchModal } from './search-modal';
 import { OllamaClient } from './ollama-client';
 import { ChatModal } from './chat-modal';
+import { WebSearchSettings, DEFAULT_WEB_SEARCH_SETTINGS } from './web-search-tool';
+import { RawNoteOrganizer, OrganizerSettings, DEFAULT_ORGANIZER_SETTINGS, OrganizeSuggestion } from './raw-note-organizer';
+import { OrganizeApprovalModal } from './organize-approval-modal';
+import { ModelPickerModal } from './model-picker-modal';
+import { ContextMenuHarness, organizeAction, summarizeAction } from './context-menu';
 
 interface VectorDBPluginSettings {
     modelPath: string;
@@ -18,6 +23,8 @@ interface VectorDBPluginSettings {
     embeddingDimension: number;
     ollamaUrl: string;
     ollamaModel: string;
+    webSearch: WebSearchSettings;
+    organizer: OrganizerSettings;
 }
 
 const DEFAULT_SETTINGS: VectorDBPluginSettings = {
@@ -31,7 +38,9 @@ const DEFAULT_SETTINGS: VectorDBPluginSettings = {
     autoIndexOnSave: true,
     embeddingDimension: 384,
     ollamaUrl: 'http://localhost:11436',
-    ollamaModel: 'ornith-35b'
+    ollamaModel: 'ornith-35b',
+    webSearch: { ...DEFAULT_WEB_SEARCH_SETTINGS },
+    organizer: { ...DEFAULT_ORGANIZER_SETTINGS },
 };
 
 export default class VectorDBPlugin extends Plugin {
@@ -43,6 +52,9 @@ export default class VectorDBPlugin extends Plugin {
     private isInitialized: boolean = false;
     private dbFilePath: string;
     private ollamaClient: OllamaClient;
+    private organizer: RawNoteOrganizer | null = null;
+    private organizerTimerId: number | null = null;
+    private contextMenuHarness: ContextMenuHarness;
 
     async onload() {
         await this.loadSettings();
@@ -53,6 +65,12 @@ export default class VectorDBPlugin extends Plugin {
 
         // Ollama client
         this.ollamaClient = new OllamaClient(this.settings.ollamaUrl, this.settings.ollamaModel);
+
+        // Context menu harness for right-click model actions
+        this.contextMenuHarness = new ContextMenuHarness(this.app, this.settings.ollamaUrl);
+        this.contextMenuHarness.registerAction(organizeAction);
+        this.contextMenuHarness.registerAction(summarizeAction);
+        this.contextMenuHarness.registerFileMenu();
 
         // Add ribbon icons
         this.addRibbonIcon('database', 'Vector Database', () => {
@@ -112,12 +130,21 @@ export default class VectorDBPlugin extends Plugin {
             }
         });
 
+        this.addCommand({
+            id: 'organize-raw-notes',
+            name: 'Organize raw notes',
+            callback: () => {
+                this.organizeRawNotes();
+            }
+        });
+
         // Add settings tab
         this.addSettingTab(new VectorDBSettingTab(this.app, this));
 
         // Initialize on startup (delayed to not block Obsidian startup)
         this.app.workspace.onLayoutReady(async () => {
             await this.initialize();
+            this.setupOrganizer();
         });
 
         // Auto-index on file save
@@ -298,9 +325,77 @@ export default class VectorDBPlugin extends Plugin {
             async (text: string) => {
                 if (!this.model) throw new Error('Model not loaded');
                 return await this.model.embed(text);
-            }
+            },
+            this.settings.webSearch,
         );
         modal.open();
+    }
+
+    private setupOrganizer() {
+        if (this.organizerTimerId !== null) {
+            window.clearInterval(this.organizerTimerId);
+        }
+
+        this.organizer = new RawNoteOrganizer(
+            this.app,
+            this.ollamaClient,
+            this.settings.organizer,
+        );
+
+        if (this.settings.organizer.enabled) {
+            const ms = this.settings.organizer.intervalMinutes * 60 * 1000;
+            this.organizerTimerId = window.setInterval(() => {
+                this.organizeRawNotes();
+            }, ms);
+        }
+    }
+
+    async organizeRawNotes() {
+        if (!this.organizer) {
+            new Notice('Organizer not initialized');
+            return;
+        }
+
+        this.organizer.updateSettings(this.settings.organizer);
+
+        const rawNotes = await this.organizer.findRawNotes();
+        if (rawNotes.length === 0) {
+            return;
+        }
+
+        const notice = new Notice(`Analyzing ${rawNotes.length} raw note(s)...`, 0);
+
+        const suggestions: OrganizeSuggestion[] = [];
+        for (const file of rawNotes) {
+            notice.setMessage(`Analyzing: ${file.basename}...`);
+            const suggestion = await this.organizer.analyzeNote(file);
+            if (suggestion) {
+                suggestions.push(suggestion);
+            }
+        }
+
+        notice.hide();
+
+        if (suggestions.length === 0) {
+            new Notice('Could not analyze any raw notes');
+            return;
+        }
+
+        if (this.settings.organizer.requireApproval) {
+            const modal = new OrganizeApprovalModal(
+                this.app,
+                suggestions,
+                async (s) => this.organizer!.applySuggestion(s),
+            );
+            modal.open();
+        } else {
+            let applied = 0;
+            for (const s of suggestions) {
+                const ok = await this.organizer.applySuggestion(s);
+                if (ok) applied++;
+            }
+            new Notice(`Organized ${applied}/${suggestions.length} notes`);
+        }
     }
 
     async search(query: string) {
@@ -525,6 +620,113 @@ class VectorDBSettingTab extends PluginSettingTab {
                     }
                 }));
 
+        // Web search settings
+        containerEl.createEl('h3', { text: 'Web Search Tool' });
+
+        new Setting(containerEl)
+            .setName('Enable web search')
+            .setDesc('Allow the Ornith model to search the web for current information')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.webSearch.enabled)
+                .onChange(async (value) => {
+                    this.plugin.settings.webSearch.enabled = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Search provider')
+            .setDesc('DuckDuckGo (no API key needed) or Google Custom Search')
+            .addDropdown(dropdown => dropdown
+                .addOption('duckduckgo', 'DuckDuckGo')
+                .addOption('google', 'Google Custom Search')
+                .setValue(this.plugin.settings.webSearch.provider)
+                .onChange(async (value: string) => {
+                    this.plugin.settings.webSearch.provider = value as 'duckduckgo' | 'google';
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Google API key')
+            .setDesc('Required for Google Custom Search (https://developers.google.com/custom-search)')
+            .addText(text => text
+                .setPlaceholder('AIza...')
+                .setValue(this.plugin.settings.webSearch.googleApiKey)
+                .onChange(async (value) => {
+                    this.plugin.settings.webSearch.googleApiKey = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Google Search Engine ID')
+            .setDesc('cx parameter from Google Custom Search')
+            .addText(text => text
+                .setPlaceholder('0123456789...')
+                .setValue(this.plugin.settings.webSearch.googleCx)
+                .onChange(async (value) => {
+                    this.plugin.settings.webSearch.googleCx = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        // Raw Note Organizer settings
+        containerEl.createEl('h3', { text: 'Raw Note Organizer' });
+
+        new Setting(containerEl)
+            .setName('Enable auto-organizer')
+            .setDesc('Periodically organize new notes from the raw folder')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.organizer.enabled)
+                .onChange(async (value) => {
+                    this.plugin.settings.organizer.enabled = value;
+                    await this.plugin.saveSettings();
+                    this.plugin.setupOrganizer();
+                }));
+
+        new Setting(containerEl)
+            .setName('Raw folder')
+            .setDesc('Folder to watch for new notes to organize')
+            .addText(text => text
+                .setPlaceholder('raw')
+                .setValue(this.plugin.settings.organizer.rawFolder)
+                .onChange(async (value) => {
+                    this.plugin.settings.organizer.rawFolder = value || 'raw';
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Interval (minutes)')
+            .setDesc('How often to check for new raw notes (default: 120 = 2 hours)')
+            .addText(text => text
+                .setPlaceholder('120')
+                .setValue(String(this.plugin.settings.organizer.intervalMinutes))
+                .onChange(async (value) => {
+                    const mins = parseInt(value);
+                    if (!isNaN(mins) && mins >= 5) {
+                        this.plugin.settings.organizer.intervalMinutes = mins;
+                        await this.plugin.saveSettings();
+                        this.plugin.setupOrganizer();
+                    }
+                }));
+
+        new Setting(containerEl)
+            .setName('Require approval')
+            .setDesc('Show approval dialog before applying changes')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.organizer.requireApproval)
+                .onChange(async (value) => {
+                    this.plugin.settings.organizer.requireApproval = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Organize now')
+            .setDesc('Run organization on raw folder immediately')
+            .addButton(btn => btn
+                .setButtonText('Organize')
+                .setCta()
+                .onClick(() => {
+                    this.plugin.organizeRawNotes();
+                }));
+
         // Ornith / LLM settings
         containerEl.createEl('h3', { text: 'Ornith (Local LLM)' });
 
@@ -536,6 +738,7 @@ class VectorDBSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.ollamaUrl)
                 .onChange(async (value) => {
                     this.plugin.settings.ollamaUrl = value;
+                    this.plugin.contextMenuHarness.setOllamaUrl(value);
                     await this.plugin.saveSettings();
                 }));
 
@@ -548,6 +751,22 @@ class VectorDBSettingTab extends PluginSettingTab {
                 .onChange(async (value) => {
                     this.plugin.settings.ollamaModel = value;
                     await this.plugin.saveSettings();
+                }))
+            .addButton(btn => btn
+                .setButtonText('Browse')
+                .onClick(() => {
+                    const client = new OllamaClient(this.plugin.settings.ollamaUrl);
+                    const modal = new ModelPickerModal(
+                        this.app,
+                        client,
+                        this.plugin.settings.ollamaUrl,
+                        async (model) => {
+                            this.plugin.settings.ollamaModel = model;
+                            await this.plugin.saveSettings();
+                            this.display();
+                        },
+                    );
+                    modal.open();
                 }));
 
         new Setting(containerEl)
